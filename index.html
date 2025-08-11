@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Simple Sail Simulator</title>
+<style>
+  :root {
+    --ui-bg: rgba(255,255,255,.85);
+    --ui-border: rgba(0,0,0,.15);
+  }
+  html, body { margin:0; padding:0; height:100%; background:#87CEFA; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  #wrap { position:fixed; inset:0; display:grid; grid-template-rows: 1fr auto; }
+  canvas { width:100%; height:100%; touch-action:none; background:linear-gradient(#87CEFA,#9ad5ff); }
+  /* Controls */
+  .hud { display:flex; gap:.75rem; padding:.5rem .75rem; align-items:center; flex-wrap:wrap; background:var(--ui-bg); border-top:1px solid var(--ui-border); backdrop-filter: blur(6px); }
+  .btn {
+    -webkit-tap-highlight-color: transparent;
+    border:1px solid var(--ui-border); background:#fff; padding:.55rem .8rem; border-radius:.75rem; font-weight:600;
+    box-shadow:0 1px 2px rgba(0,0,0,.06);
+  }
+  .pill { padding:.25rem .6rem; border-radius:999px; background:#fff; border:1px solid var(--ui-border); font-variant-numeric: tabular-nums; }
+  .flex-1 { flex:1 1 0; }
+  .stack { display:flex; align-items:center; gap:.5rem; }
+  /* Sliders (vertical) */
+  .vslider {
+    position:relative; height:120px; width:38px; display:flex; align-items:center; justify-content:center;
+    background:var(--ui-bg); border:1px solid var(--ui-border); border-radius:.75rem; padding:.35rem .2rem;
+  }
+  .vslider input { transform:rotate(-90deg); width:120px; -webkit-appearance: none; appearance: none; height:26px; background:transparent; }
+  .vslider input::-webkit-slider-runnable-track { height:8px; background:linear-gradient(90deg,#ddd,#bbb); border-radius:6px; }
+  .vslider input::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:26px; height:26px; border-radius:50%; background:#fff; border:1px solid var(--ui-border); box-shadow:0 1px 2px rgba(0,0,0,.2); margin-top:-9px; }
+  .vslider label { position:absolute; bottom:4px; font-size:.75rem; opacity:.7; }
+  /* Rudder wheel */
+  .wheel {
+    position:relative; width:92px; height:92px; border-radius:50%; background:var(--ui-bg); border:1px solid var(--ui-border);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .wheel .nub {
+    position:absolute; width:10px; height:10px; border-radius:50%; background:#111;
+    transform: translate(-50%, -50%);
+  }
+  .wheel .tick { position:absolute; width:2px; height:10px; background:#666; top:4px; left:50%; transform:translateX(-50%); border-radius:2px; }
+  .col { display:flex; gap:.5rem; align-items:center; }
+  .stat { display:flex; gap:.5rem; align-items:center; }
+  .stat b { min-width:3.2rem; text-align:right;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+
+  <!-- HUD / controls (touch friendly) -->
+  <div class="hud">
+    <button class="btn" id="randomWind">Random wind</button>
+    <div class="stat pill">Wind: <b id="windDir">000°</b> <span id="windSpd">0.0</span> m/s</div>
+    <div class="stat pill">Boat: <b id="boatHdg">000°</b> <span id="boatSpd">0.00</span> m/s</div>
+    <div class="stat pill">Heel: <b id="heelDeg">0°</b> <span id="stability">stable</span></div>
+    <div class="flex-1"></div>
+
+    <div class="col">
+      <div class="vslider">
+        <input id="mainAngle" type="range" min="-85" max="85" step="1" value="20">
+        <label>Main</label>
+      </div>
+      <div class="vslider">
+        <input id="jibAngle" type="range" min="-85" max="85" step="1" value="25">
+        <label>Jib</label>
+      </div>
+      <div class="vslider">
+        <input id="sheet" type="range" min="40" max="100" step="1" value="80">
+        <label>Sheet%</label>
+      </div>
+      <div class="wheel" id="wheel" title="Steer (drag)">
+        <div class="tick"></div>
+        <div class="nub" id="wheelNub" style="top:8px; left:50%;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ---------- math helpers ---------- */
+const TAU = Math.PI * 2;
+const DEG = 180/Math.PI;
+const RAD = Math.PI/180;
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const wrapDeg = d => (d%360+360)%360;
+const angDiff = (a,b) => { // signed shortest a-b in degrees
+  let d = wrapDeg(a-b); if (d>180) d-=360; return d;
+};
+const toVec = (dirDeg, mag) => ({x: Math.sin(dirDeg*RAD)*mag, y: -Math.cos(dirDeg*RAD)*mag}); // 0° = up
+
+/* ---------- state ---------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W=0,H=0, dpr=1;
+function resize(){
+  dpr = Math.max(1, Math.min(2, window.devicePixelRatio||1));
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = Math.floor(W*dpr); canvas.height = Math.floor(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', resize, {passive:true}); resize();
+
+const ui = {
+  windDir: document.getElementById('windDir'),
+  windSpd: document.getElementById('windSpd'),
+  boatHdg: document.getElementById('boatHdg'),
+  boatSpd: document.getElementById('boatSpd'),
+  heelDeg: document.getElementById('heelDeg'),
+  stability: document.getElementById('stability'),
+  main: document.getElementById('mainAngle'),
+  jib: document.getElementById('jibAngle'),
+  sheet: document.getElementById('sheet'),
+};
+
+const boat = {
+  x: 0.5, y: 0.6, // normalized (0..1) screen position
+  heading: 0, // deg 0 up
+  targetHeading: 0,
+  v: {x:0,y:0},
+  mass: 180, // kg (dinghy-ish)
+  areaMain: 12,
+  areaJib: 8,
+  keelCoef: 6.0,  // resists lateral drift
+  hullDrag: 0.5,  // quadratic coeff
+  heel: 0
+};
+
+const env = { windDir: 0, windSpeed: 6, rho: 1.2 };
+function randomWind() {
+  env.windDir = Math.floor(Math.random()*360);
+  env.windSpeed = +(4 + Math.random()*8).toFixed(1);
+}
+document.getElementById('randomWind').onclick = randomWind;
+randomWind();
+
+/* ---------- steering wheel ---------- */
+const wheel = document.getElementById('wheel');
+const nub = document.getElementById('wheelNub');
+let wheelDragging=false;
+wheel.addEventListener('pointerdown', e=>{
+  wheel.setPointerCapture(e.pointerId);
+  wheelDragging=true; updateWheel(e);
+});
+wheel.addEventListener('pointermove', e=>{ if(wheelDragging) updateWheel(e); });
+wheel.addEventListener('pointerup', e=>{ wheelDragging=false; });
+function updateWheel(e){
+  const r = wheel.getBoundingClientRect();
+  const cx = r.left + r.width/2, cy = r.top + r.height/2;
+  const a = Math.atan2(e.clientX-cx, cy-e.clientY)*DEG; // 0 up
+  boat.targetHeading = wrapDeg(a);
+  // place nub at rim
+  const rad = r.width/2 - 8;
+  const vx = Math.sin(boat.targetHeading*RAD)*rad;
+  const vy = -Math.cos(boat.targetHeading*RAD)*rad;
+  nub.style.left = (r.width/2 + vx) + 'px';
+  nub.style.top  = (r.height/2 + vy) + 'px';
+}
+
+/* ---------- aero/force model ---------- */
+/*
+  Very compact sail model:
+  - Apparent wind Va = Vt - Vboat
+  - Angle of attack alpha = Va angle - (boat heading + sail angle)
+  - Lift ~ sin(2*alpha), Drag ~ 0.1 + sin^2(alpha)
+  - Drive = projection of total sail force onto boat forward axis
+  - Side force -> heel/stability + leeway (reduced by keelCoef)
+  - Simple points-of-sail limiter: little/no power inside no-sail (~±35° to wind)
+*/
+function sailForces(apparent, sailAngleDeg, area, sheetPct){
+  const Va = apparent.mag;
+  if (Va < 0.2) return {drive:0, side:0, power:0};
+  const alpha = (apparent.dir - sailAngleDeg) * RAD;
+
+  // Stall limiter: fade power if |alpha| > ~70°
+  const stall= clamp(1 - Math.max(0, Math.abs(alpha*DEG)-70)/25, 0, 1);
+
+  const Cl = 1.25 * Math.sin(2*alpha) * stall;            // lift
+  const Cd = (0.12 + 0.9*Math.pow(Math.sin(alpha),2)) * stall; // drag
+
+  const q = 0.5 * env.rho * Va*Va * area * (sheetPct/100); // dynamic pressure * area * sheet efficiency
+  const L = q * Cl;
+  const D = q * Cd;
+
+  // Lift is perpendicular to apparent wind; drag is along it
+  const ax = Math.sin(apparent.dir*RAD), ay = -Math.cos(apparent.dir*RAD);
+  // Rotate lift 90° to the left of wind direction
+  const lx = -ay, ly = ax;
+
+  const Fx = L*lx + D*ax;
+  const Fy = L*ly + D*ay;
+
+  // Resolve into boat body axes (fwd/right with heading 0 up)
+  const hx = Math.sin(boat.heading*RAD), hy = -Math.cos(boat.heading*RAD);
+  const rx =  Math.cos(boat.heading*RAD), ry =  Math.sin(boat.heading*RAD); // rightward
+
+  const drive = Fx*hx + Fy*hy;     // forward component
+  const side  = Fx*rx + Fy*ry;     // lateral (to starboard positive)
+
+  // Power scalar for UI
+  const power = Math.max(0, drive) / (q+1e-6);
+
+  return {drive, side, power};
+}
+
+/* ---------- simulation loop ---------- */
+let last=performance.now();
+function step(t){
+  const dt = Math.min(0.05, (t-last)/1000); last = t;
+
+  // Smooth steer towards target heading
+  let dh = angDiff(boat.targetHeading, boat.heading);
+  boat.heading = wrapDeg(boat.heading + clamp(dh, -60*dt, 60*dt));
+
+  // Apparent wind
+  const trueWind = toVec(env.windDir, env.windSpeed);
+  const boatSpd = Math.hypot(boat.v.x, boat.v.y);
+  const Va = { x: trueWind.x - boat.v.x, y: trueWind.y - boat.v.y };
+  const VaMag = Math.hypot(Va.x, Va.y);
+  const VaDir = wrapDeg(Math.atan2(Va.x, -Va.y)*DEG);
+  const apparent = { mag: VaMag, dir: VaDir };
+
+  // Points-of-sail limiter (no-sail zone ~ ±35°)
+  const relTrue = Math.abs(angDiff(env.windDir, boat.heading));
+  const nosail = relTrue < 35 || relTrue > 325;
+  const trimEff = nosail ? 0.15 : 1.0;
+
+  // Sails
+  const mainAngle = boat.heading + parseFloat(ui.main.value); // absolute
+  const jibAngle  = boat.heading + parseFloat(ui.jib.value);
+  const sheetPct  = parseFloat(ui.sheet.value);
+
+  const fMain = sailForces(apparent, mainAngle, boat.areaMain, sheetPct) ;
+  const fJib  = sailForces(apparent,  jibAngle,  boat.areaJib,  sheetPct*0.9);
+
+  let drive = (fMain.drive + fJib.drive) * trimEff;
+  let side  = (fMain.side  + fJib.side ) * trimEff;
+
+  // Lateral resistance (keel)
+  side -= side / (1 + boat.keelCoef); // most becomes heel, little becomes leeway
+
+  // Heel & stability (deg)
+  const heelCoef = 0.0035; // tune
+  boat.heel = clamp(Math.abs(side) * heelCoef, 0, 55);
+  const heelPenalty = boat.heel>35 ? (1 - (boat.heel-35)/30) : 1;
+  const stable = boat.heel < 42;
+
+  // Hull drag (quadratic)
+  const drag = boat.hullDrag * boatSpd*boatSpd * (1 + 0.015*boat.heel);
+
+  // Forward accel along heading
+  const hx = Math.sin(boat.heading*RAD), hy = -Math.cos(boat.heading*RAD);
+  let ax = (drive*heelPenalty - drag) / boat.mass;
+  // Convert forward accel to world components
+  const axw = hx*ax, ayw = hy*ax;
+
+  // Minor leeway from leftover side force
+  const rx =  Math.cos(boat.heading*RAD), ry = Math.sin(boat.heading*RAD);
+  const leewayAccel = (side*0.08) / boat.mass;
+  const lxw = rx*leewayAccel, lyw = ry*leewayAccel;
+
+  boat.v.x += (axw + lxw) * dt;
+  boat.v.y += (ayw + lyw) * dt;
+
+  // Position integrate (wrap around screen edges)
+  boat.x = (boat.x + boat.v.x*dt / 10) % 1; if (boat.x<0) boat.x+=1;
+  boat.y = (boat.y + boat.v.y*dt / 10) % 1; if (boat.y<0) boat.y+=1;
+
+  draw(trueWind, apparent, nosail, stable);
+
+  // UI text
+  ui.windDir.textContent = String(wrapDeg(env.windDir)).padStart(3,'0')+'°';
+  ui.windSpd.textContent = env.windSpeed.toFixed(1);
+  ui.boatHdg.textContent = String(wrapDeg(boat.heading)).padStart(3,'0')+'°';
+  ui.boatSpd.textContent = (Math.hypot(boat.v.x, boat.v.y)).toFixed(2);
+  ui.heelDeg.textContent = Math.round(boat.heel)+'°';
+  ui.stability.textContent = stable ? 'stable' : 'overpowered';
+  requestAnimationFrame(step);
+}
+requestAnimationFrame(step);
+
+/* ---------- rendering ---------- */
+function draw(trueWind, apparent, nosail, stable) {
+  ctx.clearRect(0,0,W,H);
+
+  // Water ripples
+  ctx.globalAlpha = .2;
+  for (let i=0;i<12;i++){
+    const y = (i/12)*H + ((performance.now()/50 + i*80)%80);
+    ctx.fillStyle = i%2? '#ffffff':'#e9f6ff';
+    ctx.fillRect(0, (y%H), W, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // Wind arrow (top)
+  drawArrow(W/2, 30, env.windDir, 40, '#005bbb', '#77b7ff', 'WIND');
+
+  // Apparent wind arrow by boat
+  const bx = boat.x*W, by = boat.y*H;
+  drawArrow(bx, by-70, apparent.dir, 34, '#333', '#ddd', 'App');
+
+  // Points-of-sail sector near boat (reference)
+  ctx.save();
+  ctx.translate(bx,by);
+  ctx.rotate(boat.heading*RAD);
+  ctx.globalAlpha = .12;
+  ctx.fillStyle = nosail? '#ff6aa0' : '#8a2be2';
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.arc(0,0,80, -35*RAD, 35*RAD, false);
+  ctx.closePath(); ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Draw sails (simple triangles) relative to hull
+  drawBoatHull();
+
+  drawSail(parseFloat(ui.main.value),'#ffffff', 60);
+  drawSail(parseFloat(ui.jib.value),'#f2f2f2', 36);
+
+  // Heading tick
+  ctx.strokeStyle='#000'; ctx.globalAlpha=.5;
+  ctx.beginPath(); ctx.moveTo(0,-70); ctx.lineTo(0,-90); ctx.stroke();
+  ctx.globalAlpha=1;
+
+  ctx.restore();
+
+  // Speed/heel hint (bar)
+  const speed = Math.hypot(boat.v.x, boat.v.y);
+  const barW = Math.min(1, speed/4) * (W*0.5);
+  ctx.fillStyle = stable ? 'rgba(0,150,0,.25)' : 'rgba(200,0,0,.25)';
+  ctx.fillRect((W-barW)/2, H-8, barW, 6);
+
+  function drawBoatHull(){
+    ctx.fillStyle='#222'; ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(0,-28); ctx.quadraticCurveTo(10,10,0,24); ctx.quadraticCurveTo(-10,10,0,-28); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // mast
+    ctx.strokeStyle='#222'; ctx.beginPath(); ctx.moveTo(0,-4); ctx.lineTo(0,-44); ctx.stroke();
+    // boom pivot
+    ctx.beginPath(); ctx.arc(0,-4,2,0,TAU); ctx.fillStyle='#000'; ctx.fill();
+  }
+  function drawSail(angleRel, color, len){
+    ctx.save();
+    ctx.rotate(angleRel*RAD);
+    ctx.beginPath();
+    ctx.moveTo(0,-4);
+    ctx.lineTo(0, -4); ctx.lineTo(len*0.05, -24); ctx.lineTo(len*0.9, -10);
+    ctx.closePath();
+    ctx.fillStyle=color; ctx.globalAlpha = .96; ctx.fill(); ctx.globalAlpha=1;
+    // boom
+    ctx.strokeStyle='#333'; ctx.beginPath(); ctx.moveTo(0,-4); ctx.lineTo(len*0.7,-4); ctx.stroke();
+    ctx.restore();
+  }
+}
+function drawArrow(x,y,dir,length,stroke,fill,label){
+  const ang = dir*RAD;
+  const ex = x + Math.sin(ang)*length;
+  const ey = y - Math.cos(ang)*length;
+  ctx.strokeStyle = stroke; ctx.lineWidth=3; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(ex,ey); ctx.stroke();
+  // head
+  ctx.beginPath();
+  ctx.moveTo(ex,ey);
+  ctx.lineTo(ex + Math.sin((dir+150)*RAD)*12, ey - Math.cos((dir+150)*RAD)*12);
+  ctx.lineTo(ex + Math.sin((dir-150)*RAD)*12, ey - Math.cos((dir-150)*RAD)*12);
+  ctx.closePath();
+  ctx.fillStyle = fill; ctx.fill(); ctx.stroke();
+  // label
+  if (label){
+    ctx.font='12px system-ui, -apple-system, sans-serif'; ctx.fillStyle='#000'; ctx.globalAlpha=.55;
+    ctx.fillText(label, x-16, y-10); ctx.globalAlpha=1;
+  }
+}
+</script>
+</body>
+</html>
